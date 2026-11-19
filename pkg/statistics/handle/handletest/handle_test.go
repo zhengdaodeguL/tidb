@@ -984,6 +984,49 @@ func TestStatsCacheUpdateTimeout(t *testing.T) {
 	require.Equal(t, 2, int(globalStats2.ModifyCount))
 }
 
+func TestStatsCacheUpdateAnalyzedTableBelowWatermark(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t (a int)")
+	tk.MustExec("insert into t values (1)")
+	tk.MustExec("analyze table t all columns")
+	tk.MustExec("create table marker (a int)")
+	tk.MustExec("analyze table marker all columns")
+	table, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
+	require.NoError(t, err)
+	tbl := table.Meta()
+	marker, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("marker"))
+	require.NoError(t, err)
+	h := dom.StatsHandle()
+	h.Clear()
+	tk.MustExec("update mysql.stats_meta set version = 10 where table_id = ?", tbl.ID)
+	tk.MustExec("update mysql.stats_meta set version = 0 where table_id = ?", marker.Meta().ID)
+	require.NoError(t, h.Update(context.Background(), dom.InfoSchema()))
+	require.Equal(t, uint64(10), h.GetPhysicalTableStats(tbl.ID, tbl).Version)
+
+	// Another table moves the global watermark past a late commit for t.
+	tk.MustExec("update mysql.stats_meta set version = 30 where table_id = ?", marker.Meta().ID)
+	require.NoError(t, h.Update(context.Background(), dom.InfoSchema()))
+	require.Equal(t, uint64(30), h.MaxTableStatsVersion())
+	tk.MustExec("update mysql.stats_meta set version = 20, count = 2 where table_id = ?", tbl.ID)
+	require.NoError(t, h.Update(context.Background(), dom.InfoSchema()))
+	require.Equal(t, uint64(10), h.GetPhysicalTableStats(tbl.ID, tbl).Version)
+
+	require.NoError(t, h.Update(context.Background(), dom.InfoSchema(), tbl.ID, tbl.ID))
+	require.Equal(t, uint64(20), h.GetPhysicalTableStats(tbl.ID, tbl).Version)
+	require.Equal(t, int64(2), h.GetPhysicalTableStats(tbl.ID, tbl).RealtimeCount)
+	require.Equal(t, uint64(30), h.MaxTableStatsVersion())
+
+	// Explicit refreshes still reject versions that do not advance this table.
+	for _, version := range []uint64{20, 19} {
+		tk.MustExec("update mysql.stats_meta set version = ?, count = 3 where table_id = ?", version, tbl.ID)
+		require.NoError(t, h.Update(context.Background(), dom.InfoSchema(), tbl.ID))
+		require.Equal(t, uint64(20), h.GetPhysicalTableStats(tbl.ID, tbl).Version)
+		require.Equal(t, int64(2), h.GetPhysicalTableStats(tbl.ID, tbl).RealtimeCount)
+	}
+}
+
 // panicOnTableInfoByIDHandle panics in the per-table loop of StatsCacheImpl.Update.
 type panicOnTableInfoByIDHandle struct {
 	statstypes.StatsHandle

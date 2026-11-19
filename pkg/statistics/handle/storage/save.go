@@ -170,7 +170,7 @@ func SaveAnalyzeResultToStorage(sctx sessionctx.Context,
 	// Using the negative table ID keeps it separate from real table IDs and from other fake IDs.
 	fakeID := -tableID
 	tableIDStrs := []string{strconv.FormatInt(fakeID, 10), strconv.FormatInt(tableID, 10)}
-	rs, err = util.Exec(sctx, "select snapshot, count, modify_count from mysql.stats_meta where table_id in (%?) for update", tableIDStrs)
+	rs, err = util.Exec(sctx, "select snapshot, count, modify_count, version from mysql.stats_meta where table_id in (%?) for update", tableIDStrs)
 	if err != nil {
 		return 0, err
 	}
@@ -194,6 +194,9 @@ func SaveAnalyzeResultToStorage(sctx sessionctx.Context,
 		}
 		curCnt = int64(rows[0].GetUint64(1))
 		curModifyCnt = rows[0].GetInt64(2)
+		// Another writer may have advanced the version since this transaction started.
+		// The cache needs a strictly newer version to reload the saved histograms.
+		version = max(version, rows[0].GetUint64(3)+1)
 	}
 
 	if len(rows) == 0 || results.StatsVer != statistics.Version2 {

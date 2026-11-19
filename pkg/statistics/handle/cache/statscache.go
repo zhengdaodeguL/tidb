@@ -126,11 +126,7 @@ func (s *StatsCacheImpl) Update(ctx context.Context, is infoschema.InfoSchema, t
 		dur := time.Since(start)
 		tidbmetrics.StatsDeltaLoadHistogram.Observe(dur.Seconds())
 	}()
-	lastVersion := s.GetNextCheckVersionWithOffset()
-	var (
-		skipMoveForwardStatsCache bool
-		rows                      []chunk.Row
-	)
+	var rows []chunk.Row
 	if err := util.CallWithSCtx(s.statsHandle.SPool(), func(sctx sessionctx.Context) error {
 		query := "SELECT"
 		if onlyForAnalyzedTables {
@@ -138,13 +134,12 @@ func (s *StatsCacheImpl) Update(ctx context.Context, is infoschema.InfoSchema, t
 		} else {
 			query += " /*+ use_index(mysql.stats_meta, idx_ver) */"
 		}
-		query += " version, table_id, modify_count, count, snapshot, last_stats_histograms_version from mysql.stats_meta where version > %? "
-		args := []any{lastVersion}
+		query += " version, table_id, modify_count, count, snapshot, last_stats_histograms_version from mysql.stats_meta"
+		var args []any
 
 		if onlyForAnalyzedTables {
-			// When updating specific tables, we skip incrementing the max stats version to avoid missing
-			// delta updates for other tables. The max version only advances when doing a full update.
-			skipMoveForwardStatsCache = true
+			// An ANALYZE can commit after the global watermark has passed its version.
+			// Load these IDs regardless of the watermark and compare versions per table below.
 			// Sort and deduplicate the table IDs to remove duplicates
 			slices.Sort(tableAndPartitionIDs)
 			tableAndPartitionIDs = slices.Compact(tableAndPartitionIDs)
@@ -153,10 +148,13 @@ func (s *StatsCacheImpl) Update(ctx context.Context, is infoschema.InfoSchema, t
 			for _, tableID := range tableAndPartitionIDs {
 				tableStringIDs = append(tableStringIDs, strconv.FormatInt(tableID, 10))
 			}
-			query += "and table_id in (%?) "
-			args = append(args, tableStringIDs)
+			query += " where table_id in (%?)"
+			args = []any{tableStringIDs}
+		} else {
+			query += " where version > %?"
+			args = []any{s.GetNextCheckVersionWithOffset()}
 		}
-		query += "order by version"
+		query += " order by version"
 		rows, _, err = util.ExecRows(sctx, query, args...)
 		return err
 	}); err != nil {
@@ -167,9 +165,8 @@ func (s *StatsCacheImpl) Update(ctx context.Context, is infoschema.InfoSchema, t
 		s.UpdateStatsCache(types.CacheUpdate{
 			Updated: toUpdate,
 			Deleted: toDelete,
-			Options: types.UpdateOptions{
-				SkipMoveForward: skipMoveForwardStatsCache,
-			},
+			// Advancing the watermark on a targeted refresh could hide updates to other tables.
+			Options: types.UpdateOptions{SkipMoveForward: onlyForAnalyzedTables},
 		})
 	})
 

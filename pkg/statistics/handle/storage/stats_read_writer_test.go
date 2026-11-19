@@ -94,6 +94,45 @@ func TestUpdateStatsMetaVersionForGC(t *testing.T) {
 	).Check(testkit.Rows("0"))
 }
 
+func TestAnalyzeStatsVersionDoesNotRegress(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t (a int)")
+	tk.MustExec("insert into t values (1), (2)")
+	tk.MustExec("flush stats_delta *.*")
+	table, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
+	require.NoError(t, err)
+	tbl := table.Meta()
+	h := dom.StatsHandle()
+	updateTK := testkit.NewTestKit(t, store)
+	var cachedVersion uint64
+	var once sync.Once
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/statistics/handle/storage/saveAnalyzeResultToStorage", func() {
+		once.Do(func() {
+			// Publish and cache a newer version after the ANALYZE save transaction starts.
+			updateTK.MustExec("begin pessimistic")
+			txn, err := updateTK.Session().Txn(true)
+			require.NoError(t, err)
+			cachedVersion = txn.StartTS()
+			updateTK.MustExec("update mysql.stats_meta set version = ? where table_id = ?", cachedVersion, tbl.ID)
+			updateTK.MustExec("commit")
+			require.NoError(t, h.Update(context.Background(), dom.InfoSchema()))
+			require.Equal(t, cachedVersion, h.GetPhysicalTableStats(tbl.ID, tbl).Version)
+		})
+	})
+	tk.MustExec("analyze table t all columns")
+	rows := tk.MustQuery("select version from mysql.stats_meta where table_id = ?", tbl.ID).Rows()
+	storedVersion, err := strconv.ParseUint(rows[0][0].(string), 10, 64)
+	require.NoError(t, err)
+	histograms := tk.MustQuery("show stats_histograms where db_name = 'test' and table_name = 't'").Rows()
+	t.Logf("cached version before save: %d, stored version after save: %d, histogram rows: %d", cachedVersion, storedVersion, len(histograms))
+	require.Greater(t, storedVersion, cachedVersion)
+	require.Len(t, histograms, 1)
+	tk.MustQuery("select version from mysql.stats_histograms where table_id = ?", tbl.ID).Check(testkit.Rows(strconv.FormatUint(storedVersion, 10)))
+	tk.MustQuery("select last_stats_histograms_version from mysql.stats_meta where table_id = ?", tbl.ID).Check(testkit.Rows(strconv.FormatUint(storedVersion, 10)))
+}
+
 func TestSlowStatsSaving(t *testing.T) {
 	err := failpoint.Enable("github.com/pingcap/tidb/pkg/statistics/handle/storage/slowStatsSaving", "return(true)")
 	require.NoError(t, err)
