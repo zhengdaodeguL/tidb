@@ -1313,7 +1313,12 @@ func buildOrderedList(ctx base.PlanContext, plan base.Plan, list []*ast.Assignme
 			(castToTP.EvalType() == types.ETInt ||
 				castToTP.EvalType() == types.ETDecimal ||
 				castToTP.EvalType() == types.ETReal)
-		if !isUnsignedNumericTarget {
+		// Let table.CastValue convert numeric and string values assigned to DECIMAL
+		// so the executor can report overflow with the column name and row number.
+		sourceType := expr.GetType(ctx.GetExprCtx().GetEvalCtx()).GetType()
+		isNumericOrStringToDecimal := castToTP.GetType() == mysql.TypeNewDecimal &&
+			(types.IsTypeNumeric(sourceType) || types.IsString(sourceType))
+		if !isUnsignedNumericTarget && !isNumericOrStringToDecimal {
 			expr = expression.BuildCastFunction(ctx.GetExprCtx(), expr, castToTP)
 		}
 		if allAssignmentsAreConstant {

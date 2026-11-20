@@ -852,6 +852,84 @@ ORDER BY field1`).Check(testkit.Rows())
 		tk.MustGetErrCode("update foo set bing = -1 where id = 2", errno.ErrWarnDataOutOfRange)
 	}
 
+	// issue-73529-point-update-signed-decimal-overflow
+	{
+		tk := prepareSharedTestKit(t)
+		tk.MustExec("create table t (id int primary key, c decimal(12,2), k int, unique key uk(k))")
+		tk.MustExec("insert into t values (1, 0, 10), (2, 0, 20), (3, 0, 30)")
+		tk.MustExec("create table tp (id int primary key, c decimal(12,2)) partition by hash(id) partitions 4")
+		tk.MustExec("insert into tp values (1, 0), (2, 0), (3, 0)")
+		for _, tt := range []struct {
+			tableName string
+			predicate string
+			plan      string
+		}{
+			{"t", "id = 1", "Point_Get"},
+			{"t", "k = 10", "Point_Get"},
+			{"t", "id in (1)", "Point_Get"},
+			{"t", "id in (1, 2)", "Batch_Point_Get"},
+			{"t", "id >= 2", "TableReader"},
+			{"tp", "id = 1", "Point_Get"},
+			{"tp", "id in (1)", "Point_Get"},
+			{"tp", "id >= 2", "TableReader"},
+		} {
+			t.Run("issue-73529/"+tt.tableName+"/"+tt.predicate, func(t *testing.T) {
+				tk := testkit.NewTestKit(t, store)
+				tk.MustExec("use test")
+				tk.MustExec("set sql_mode = 'STRICT_TRANS_TABLES'")
+				tk.MustExec("update " + tt.tableName + " set c = 0")
+				update := "update " + tt.tableName + " set c = %s where " + tt.predicate
+				selectValues := "select distinct c from " + tt.tableName + " where " + tt.predicate
+				tk.MustHavePlan(fmt.Sprintf(update, "10000000000.00"), tt.plan)
+				for _, value := range []string{
+					"10000000000.00", "-10000000000.00", "10000000000", "1e10",
+					"18446744073709551516", "'10000000000.00'", "c + 10000000000.00",
+				} {
+					sql := fmt.Sprintf(update, value)
+					require.EqualError(t, tk.ExecToErr(sql), "[types:1264]Out of range value for column 'c' at row 1", sql)
+				}
+				tk.MustQuery("select c from " + tt.tableName + " order by id").Check(testkit.Rows("0.00", "0.00", "0.00"))
+
+				// An overflow inside an explicit CAST remains an expression error.
+				require.EqualError(t, tk.ExecToErr(fmt.Sprintf(update, "cast(10000000000.00 as decimal(12,2))")),
+					"[types:1690]DECIMAL value is out of range in '(12, 2)'")
+				for _, value := range []struct{ input, expected string }{
+					{"9999999999.99", "9999999999.99"},
+					{"-9999999999.99", "-9999999999.99"},
+					{"1.234", "1.23"},
+				} {
+					tk.MustExec(fmt.Sprintf(update, value.input))
+					tk.MustQuery(selectValues).Check(testkit.Rows(value.expected))
+				}
+
+				tk.MustExec("prepare stmt73529 from '" + fmt.Sprintf(update, "?") + "'")
+				tk.MustExec("set @v = 1.23")
+				tk.MustExec("execute stmt73529 using @v")
+				tk.MustExec("set @v = 10000000000.00")
+				require.EqualError(t, tk.ExecToErr("execute stmt73529 using @v"),
+					"[types:1264]Out of range value for column 'c' at row 1")
+				tk.MustQuery(selectValues).Check(testkit.Rows("1.23"))
+				tk.MustExec("deallocate prepare stmt73529")
+			})
+		}
+
+		// Non-strict point updates must also follow the normal assignment path.
+		tk.MustExec("set sql_mode = ''")
+		tk.MustExec("update t set c = 0")
+		rangeErr := tk.ExecToErr("update t set c = 10000000000.00 where id >= 1 and id <= 1")
+		rangeWarnings := tk.MustQuery("show warnings").Rows()
+		rangeValues := tk.MustQuery("select c from t where id = 1").Rows()
+		tk.MustExec("update t set c = 0")
+		pointErr := tk.ExecToErr("update t set c = 10000000000.00 where id = 1")
+		if rangeErr == nil {
+			require.NoError(t, pointErr)
+		} else {
+			require.EqualError(t, pointErr, rangeErr.Error())
+		}
+		require.Equal(t, rangeWarnings, tk.MustQuery("show warnings").Rows())
+		require.Equal(t, rangeValues, tk.MustQuery("select c from t where id = 1").Rows())
+	}
+
 	// issue-67534-point-update-unsigned-real-negative
 	{
 		tk := prepareSharedTestKit(t)
