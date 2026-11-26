@@ -78,6 +78,31 @@ func runPredicatePushdownTestDataWithResult(t *testing.T, tk *testkit.TestKit, c
 }
 
 func TestPredicatePushdownSuite(t *testing.T) {
+	t.Run("always_false_if_filter", func(t *testing.T) {
+		tk := testkit.NewTestKit(t, testkit.CreateMockStore(t))
+		tk.MustExec("use test")
+		tk.MustExec("create table t0 (k bigint, v bigint)")
+		tk.MustExec("create table t1 (k bigint, v bigint)")
+
+		const joinQuery = "select t0.v from t0 join t1 on t0.k = t1.k where "
+		const singleQuery = "select v from t0 where "
+		const explain = "explain format = 'plan_tree' "
+		plan := strings.Join(testdata.ConvertRowsToStrings(tk.MustQuery(explain+joinQuery+"false").Rows()), "\n")
+		require.Contains(t, plan, "TableDual")
+		for _, tc := range []struct {
+			name string
+			sql  string
+		}{
+			{"join_nullif", joinQuery + "nullif(0, t0.v + t1.v)"},
+			{"join_if", joinQuery + "if(t0.v + t1.v = 0, null, 0)"},
+			{"single_table_nullif", singleQuery + "nullif(0, v)"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				plan := strings.Join(testdata.ConvertRowsToStrings(tk.MustQuery(explain+tc.sql).Rows()), "\n")
+				require.Contains(t, plan, "TableDual", "query should be folded before scanning or joining:\n%s", plan)
+			})
+		}
+	})
 	t.Run("nested_in_non_null_keys", func(t *testing.T) {
 		store := testkit.CreateMockStore(t)
 		tk := testkit.NewTestKit(t, store)

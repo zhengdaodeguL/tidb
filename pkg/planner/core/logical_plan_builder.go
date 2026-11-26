@@ -1473,6 +1473,9 @@ func (b *PlanBuilder) buildSelection(ctx context.Context, p base.LogicalPlan, wh
 	for _, expr := range expressions {
 		cnfItems := expression.SplitCNFItems(expr)
 		for _, item := range cnfItems {
+			if isAlwaysFalseIf(item, foldEvalCtx, useCache) {
+				item = expression.NewZero()
+			}
 			if con, ok := item.(*expression.Constant); ok && expression.ConstExprConsiderPlanCache(con, useCache) {
 				ret, _, err := expression.EvalBool(foldEvalCtx, expression.CNFExprs{con}, chunk.Row{})
 				if err != nil {
@@ -1515,6 +1518,28 @@ func (b *PlanBuilder) buildSelection(ctx context.Context, p base.LogicalPlan, wh
 	selection.Conditions = cnfExpres
 	selection.SetChildren(p)
 	return selection, nil
+}
+
+// isAlwaysFalseIf reports whether an IF predicate can only return NULL or zero.
+func isAlwaysFalseIf(expr expression.Expression, evalCtx expression.EvalContext, useCache bool) bool {
+	sf, ok := expr.(*expression.ScalarFunction)
+	if !ok || sf.FuncName.L != ast.If || len(sf.GetArgs()) != 3 || !expression.IsImmutableFunc(sf.GetArgs()[0]) {
+		return false
+	}
+	for _, branch := range sf.GetArgs()[1:] {
+		con, ok := branch.(*expression.Constant)
+		if !ok || !expression.ConstExprConsiderPlanCache(con, useCache) {
+			return false
+		}
+		if con.Value.IsNull() {
+			continue
+		}
+		value, err := con.Value.ToBool(evalCtx.TypeCtx())
+		if err != nil || value != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // buildProjectionFieldNameFromColumns builds the field name, table name and database name when field expression is a column reference.
