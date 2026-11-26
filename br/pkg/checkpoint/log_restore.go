@@ -242,12 +242,13 @@ func GetCheckpointTaskInfo(
 }
 
 type CheckpointIngestIndexRepairSQL struct {
-	IndexID    int64     `json:"index-id"`
-	SchemaName ast.CIStr `json:"schema-name"`
-	TableName  ast.CIStr `json:"table-name"`
-	IndexName  string    `json:"index-name"`
-	AddSQL     string    `json:"add-sql"`
-	AddArgs    []any     `json:"add-args"`
+	IndexID     int64                    `json:"index-id"`
+	SchemaName  ast.CIStr                `json:"schema-name"`
+	TableName   ast.CIStr                `json:"table-name"`
+	IndexName   string                   `json:"index-name"`
+	AddSQL      string                   `json:"add-sql"`
+	AddArgs     []any                    `json:"add-args"`
+	SplitPolicy *model.RegionSplitPolicy `json:"split-policy,omitempty"`
 
 	OldIndexIDFound bool `json:"-"`
 	IndexRepaired   bool `json:"-"`

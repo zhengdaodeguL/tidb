@@ -174,12 +174,13 @@ func generateRepairIngestIndexSQLs(
 		}
 
 		sqls = append(sqls, checkpoint.CheckpointIngestIndexRepairSQL{
-			IndexID:    indexID,
-			SchemaName: info.SchemaName,
-			TableName:  info.TableName,
-			IndexName:  info.IndexInfo.Name.O,
-			AddSQL:     addSQL.String(),
-			AddArgs:    addArgs,
+			IndexID:     indexID,
+			SchemaName:  info.SchemaName,
+			TableName:   info.TableName,
+			IndexName:   info.IndexInfo.Name.O,
+			AddSQL:      addSQL.String(),
+			AddArgs:     addArgs,
+			SplitPolicy: info.IndexInfo.RegionSplitPolicy,
 		})
 
 		return nil
@@ -202,6 +203,29 @@ func generateRepairIngestIndexSQLs(
 	return sqls, fkSqls, false, nil
 }
 
+func repairSplitPolicySQLs(sql checkpoint.CheckpointIngestIndexRepairSQL) ([]string, error) {
+	policy := sql.SplitPolicy
+	prefix, err := sqlescape.EscapeSQL("ALTER TABLE %n.%n SPLIT INDEX %n", sql.SchemaName.O, sql.TableName.O, sql.IndexName)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	// The stored bounds are restored expressions, with quotes doubled and backslashes unchanged.
+	stmts := []string{
+		"SET @br_saved_sql_mode = @@sql_mode, @br_saved_time_zone = @@time_zone",
+		"SET @@sql_mode = 'NO_BACKSLASH_ESCAPES'",
+	}
+	if policy.TimeZone != "" {
+		setTimeZone, err := sqlescape.EscapeSQL("SET @@time_zone = %?", policy.TimeZone)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		stmts = append(stmts, setTimeZone)
+	}
+	stmts = append(stmts, fmt.Sprintf("%s BETWEEN (%s) AND (%s) REGIONS %d",
+		prefix, strings.Join(policy.Lower, ", "), strings.Join(policy.Upper, ", "), policy.Regions))
+	return append(stmts, "SET @@sql_mode = @br_saved_sql_mode, @@time_zone = @br_saved_time_zone"), nil
+}
+
 func writeRepairIngestIndexSQLFile(
 	ctx context.Context,
 	storage storeapi.Storage,
@@ -217,14 +241,24 @@ func writeRepairIngestIndexSQLFile(
 	builder.WriteString("-- SQLs for rebuilding indexes skipped by PITR restore.\n")
 	builder.WriteString("-- Execute them manually after restore if you need these indexes and foreign keys.\n")
 	for _, sql := range sqls {
-		if sql.IndexRepaired {
-			continue
+		if !sql.IndexRepaired {
+			if err := sqlescape.FormatSQL(&builder, sql.AddSQL, sql.AddArgs...); err != nil {
+				return errors.Trace(err)
+			}
+			builder.WriteString(";\n")
+			sqlCount++
 		}
-		if err := sqlescape.FormatSQL(&builder, sql.AddSQL, sql.AddArgs...); err != nil {
-			return errors.Trace(err)
+		if sql.SplitPolicy != nil {
+			stmts, err := repairSplitPolicySQLs(sql)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			for _, stmt := range stmts {
+				builder.WriteString(stmt)
+				builder.WriteString(";\n")
+			}
+			sqlCount++
 		}
-		builder.WriteString(";\n")
-		sqlCount++
 	}
 	for _, fk := range fkSqls {
 		if fk.ForeignKeyUpdated {
@@ -436,6 +470,37 @@ func RepairIndexes(
 			indexSession := indexSessions[id%uint64(len(indexSessions))]
 			if err := indexSession.ExecuteInternal(ectx, fk.AddSQL, fk.AddArgs...); err != nil {
 				return errors.Trace(err)
+			}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return errors.Trace(err)
+	}
+	// A checkpoint retry may find the replacement index public before its policy was restored.
+	info = dom.InfoSchema()
+	eg, ectx = errgroup.WithContext(ctx)
+	for _, sql := range sqls {
+		if sql.SplitPolicy == nil {
+			continue
+		}
+		table, err := info.TableByName(ectx, sql.SchemaName, sql.TableName)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if idx := table.Meta().FindIndexByName(strings.ToLower(sql.IndexName)); idx != nil && idx.RegionSplitPolicy != nil {
+			continue
+		}
+		workerpool.ApplyWithIDInErrorGroup(eg, func(id uint64) error {
+			stmts, err := repairSplitPolicySQLs(sql)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			indexSession := indexSessions[id%uint64(len(indexSessions))]
+			for _, stmt := range stmts {
+				if err := indexSession.Execute(ectx, stmt); err != nil {
+					return errors.Trace(err)
+				}
 			}
 			return nil
 		})

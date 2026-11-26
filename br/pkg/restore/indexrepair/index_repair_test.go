@@ -35,13 +35,15 @@ import (
 
 func TestRepairGlobalIndexes(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		definition string
+		name             string
+		definition       string
+		checkSplitPolicy bool
 	}{
-		{"integer_handle", "id int primary key clustered, a int, b varchar(30), key local_idx(id), key idx(a) global, unique key uk(a) global"},
-		{"common_handle", "id int, a int, b varchar(30), primary key(id,b) clustered, key local_idx(id), key idx(a) global, unique key uk(a) global"},
-		{"hidden_handle", "id int, a int, b varchar(30), key local_idx(id), key idx(a) global, unique key uk(a) global"},
-		{"global_primary", "id int, a int auto_increment, b varchar(30), primary key(a) nonclustered global, key local_idx(id), key idx(b) global"},
+		{"integer_handle", "id int primary key clustered, a int, b varchar(30), key local_idx(id), key idx(a) global, unique key uk(a) global", false},
+		{"global_split_policy", "id int primary key clustered, a int, b varchar(30), key local_idx(id), key idx(a) global, unique key uk(a) global", true},
+		{"common_handle", "id int, a int, b varchar(30), primary key(id,b) clustered, key local_idx(id), key idx(a) global, unique key uk(a) global", false},
+		{"hidden_handle", "id int, a int, b varchar(30), key local_idx(id), key idx(a) global, unique key uk(a) global", false},
+		{"global_primary", "id int, a int auto_increment, b varchar(30), primary key(a) nonclustered global, key local_idx(id), key idx(b) global", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := utiltest.CreateRestoreSchemaSuite(t)
@@ -55,6 +57,10 @@ func TestRepairGlobalIndexes(t *testing.T) {
 			tk.MustExec("INSERT INTO test.t VALUES (1,1,'one'),(11,2,'two')")
 			if tc.name != "global_primary" {
 				tk.MustExec("INSERT INTO test.t VALUES (2,NULL,'null-one'),(12,NULL,'null-two')")
+			}
+			if tc.checkSplitPolicy {
+				tk.MustExec("ALTER TABLE test.t SPLIT INDEX idx BETWEEN (0) AND (100) REGIONS 3")
+				tk.MustExec("ALTER TABLE test.t SPLIT INDEX local_idx BETWEEN (0) AND (100) REGIONS 3")
 			}
 			ctx := context.Background()
 			tbl, err := s.Mock.InfoSchema().TableByName(ctx, ast.NewCIStr("test"), ast.NewCIStr("t"))
@@ -153,6 +159,11 @@ func TestRepairGlobalIndexes(t *testing.T) {
 			// A second invocation must resume persisted SQLs without dropping rebuilt indexes.
 			require.NoError(t, indexrepair.RepairIndexes(ctx, s.Mock.Domain, nil, meta, g, nil))
 			tk.MustExec("ADMIN CHECK TABLE test.t")
+			if tc.checkSplitPolicy {
+				createSQL := tk.MustQuery("SHOW CREATE TABLE test.t").Rows()[0][1].(string)
+				require.Contains(t, createSQL, "SPLIT INDEX `idx` BETWEEN (0) AND (100) REGIONS 3")
+				require.Contains(t, createSQL, "SPLIT INDEX `local_idx` BETWEEN (0) AND (100) REGIONS 3")
+			}
 		})
 	}
 }
