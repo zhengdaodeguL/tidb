@@ -3432,3 +3432,56 @@ func TestOrderingIdxSelectivityRatioForSemiMergeJoin(t *testing.T) {
 	tk.MustExec("set @@session.tidb_opt_ordering_index_selectivity_ratio = 0.1")
 	tk.MustHavePlan("select 1 from t where t.state = 'pending' and not exists (select 1 from s where s.t_id = t.id) limit 1", "IndexJoin")
 }
+
+func TestOrderingIdxSelectivityRatioForMergeJoinWithLimit(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	prepareAntiJoinLimitTables(t, tk, dom)
+
+	// Project columns from both tables to keep the join in the plan.
+	query := "select /*+ merge_join(t, s) */ t.id, s.t_id from t use index (primary) " +
+		"join s use index (uk_t_id) on s.t_id = t.id where t.state = 'pending'"
+	t.Run("plan", func(t *testing.T) {
+		planStats := func(suffix, ratio string) (cost, scanRows float64) {
+			tk.MustExec("set @@session.tidb_opt_ordering_index_selectivity_ratio = " + ratio)
+			rows := tk.MustQuery("explain format=verbose " + query + suffix).Rows()
+			for _, row := range rows {
+				if strings.Contains(row[0].(string), "MergeJoin") {
+					require.Contains(t, row[5], "inner join")
+					var err error
+					cost, err = strconv.ParseFloat(row[2].(string), 64)
+					require.NoError(t, err)
+				}
+				if strings.Contains(row[0].(string), "IndexFullScan") && strings.Contains(row[4].(string), "table:s, index:uk_t_id") {
+					require.Contains(t, row[5], "keep order:true")
+					var err error
+					scanRows, err = strconv.ParseFloat(row[1].(string), 64)
+					require.NoError(t, err)
+				}
+			}
+			require.Positive(t, cost, "expected MergeJoin in %v", rows)
+			require.Positive(t, scanRows, "expected ordered scan of s in %v", rows)
+			return cost, scanRows
+		}
+
+		baseCost, baseScan := planStats(" limit 1", "0")
+		cost, scan := planStats(" limit 1", "1")
+		orderedCost, orderedScan := planStats(" order by t.id limit 1", "1")
+		require.Greater(t, cost, baseCost)
+		require.Greater(t, scan, baseScan)
+		// All s keys precede the first pending t row, regardless of ORDER BY.
+		require.Greater(t, scan, 3500.0)
+		require.InEpsilon(t, orderedCost, cost, 0.01)
+		require.InEpsilon(t, orderedScan, scan, 0.01)
+	})
+	t.Run("inner join result", func(t *testing.T) {
+		tk.MustExec("set @@session.tidb_opt_ordering_index_selectivity_ratio = 1")
+		tk.MustQuery(query + " limit 1").Check(testkit.Rows())
+	})
+	t.Run("left outer join result", func(t *testing.T) {
+		tk.MustExec("set @@session.tidb_opt_ordering_index_selectivity_ratio = 1")
+		tk.MustQuery("select t.id is not null, s.t_id is null from t use index (primary) " +
+			"left outer join s use index (uk_t_id) on s.t_id = t.id where t.state = 'pending' limit 1").
+			Check(testkit.Rows("1 1"))
+	})
+}
